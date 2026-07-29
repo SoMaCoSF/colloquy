@@ -38,3 +38,10 @@ id = "lcars"
 title = "Colloquy LCARS Control"
 placement = "overlay"
 command = ["node", "bin/lcars-tui.mjs"]
+
+[[action]]
+id = "somaco.colloquy.slurp"
+title = "Colloquy: Slurp Idea to Docs"
+command = ["node", "bin/slurp.mjs"]
+platforms = ["linux", "macos", "windows"]
+contexts = ["workspace"]
