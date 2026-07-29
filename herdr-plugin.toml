@@ -1,0 +1,40 @@
+﻿id = "somaco.colloquy"
+name = "Colloquy"
+version = "0.2.0"
+min_herdr_version = "0.7.0"
+description = "Self-addressing, ephemerally-cached causal DAG audit logs and telemetry for agent swarms."
+platforms = ["linux", "macos", "windows"]
+
+[[build]]
+command = ["npm", "install"]
+
+[[startup]]
+command = ["node", "bin/colloquy-daemon.mjs"]
+
+[[actions]]
+id = "mint"
+title = "Colloquy: Mint Session (0x009)"
+contexts = ["workspace", "pane"]
+command = ["node", "bin/mint.mjs", "--interactive"]
+
+[[actions]]
+id = "fork"
+title = "Colloquy: Counterfactual Fork at Decision Node"
+contexts = ["pane"]
+command = ["node", "bin/fork.mjs"]
+
+[[actions]]
+id = "view-lcars"
+title = "Colloquy: Toggle LCARS Dashboard"
+contexts = ["workspace"]
+command = ["node", "bin/lcars-tui.mjs"]
+
+[[events]]
+on = "worktree.created"
+command = ["node", "bin/mint.mjs", "--auto"]
+
+[[panes]]
+id = "lcars"
+title = "Colloquy LCARS Control"
+placement = "overlay"
+command = ["node", "bin/lcars-tui.mjs"]

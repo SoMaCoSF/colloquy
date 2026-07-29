@@ -1,0 +1,11 @@
+﻿{
+  "name": "colloquy-skill-plugin",
+  "version": "0.2.0",
+  "description": "Colloquy causal DAG audit logs & session telemetry skill and plugin",
+  "type": "module",
+  "main": "bin/colloquy-daemon.mjs",
+  "dependencies": {
+    "@libsql/client": "^0.6.0"
+  },
+  "keywords": ["herdr-plugin", "colloquy", "gyst", "agent-telemetry"]
+}

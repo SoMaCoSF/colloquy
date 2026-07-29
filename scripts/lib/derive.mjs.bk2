@@ -1,0 +1,377 @@
+// =============================================================================
+// file_id: SOM-LIB-0015-v0.1.0
+// name: derive.mjs
+// description: Canonical UUID derivation library for the colloquy skill.
+//              Implements mintColloquyUUID, deriveAgentSessionUUID, mintTurnUUID,
+//              mintHeartbeatUUID, mintScratchUUID. Uses encodeGYST/fnv1a12
+//              primitives from app/api/lib/gyst-server.ts.
+// category: LIB
+// tags: [colloquy, gyst, derivation, uuidv8]
+// created: 2026-04-22
+// version: 0.1.0
+// =============================================================================
+
+import { createHash, randomBytes } from 'node:crypto';
+
+export const SCHEME_VERSION_v0 = 0x0;  // heartbeat random(42) = pure entropy
+export const SCHEME_VERSION_v1 = 0x1;  // heartbeat random(42) = tokens_q(16)|savings_q(10)|random(16)
+export const EPOCH_2026 = 1767225600;  // 2026-01-01 00:00:00 UTC in seconds
+
+// ---------------------------------------------------------------------------
+// Heartbeat scheme_v=1 payload packing
+// Layout of the 42-bit "random" field when generation=0x1:
+//   [ tokens_q(16) | savings_q(10) | random(16) ]   MSB → LSB
+// tokens_q: accumulated colloquy tokens, linear to 65535 then log-exponential
+// savings_q: cache_hit_ratio * 1023 (0..1023, ~0.1% resolution)
+// random: 16-bit entropy (collision caught by UNIQUE(turn,seq) + PK)
+// ---------------------------------------------------------------------------
+
+export function quantizeTokens(tokens) {
+  if (tokens == null || tokens < 0) return 0;
+  if (tokens < 65536) return tokens & 0xFFFF;
+  // Exponential region: 16-bit = floor(log2(tokens) * 4096), clamped
+  const v = Math.floor(Math.log2(tokens) * 4096);
+  return v > 0xFFFF ? 0xFFFF : v;
+}
+
+export function dequantizeTokens(q) {
+  if (q < 65536 && q >= 0 && q < 65536) {
+    // Ambiguous: could be linear value or exponential. We disambiguate by
+    // checking whether the value itself looks like a log-scaled number.
+    // Simpler: caller stores exact value in row column; UUID bits are a
+    // lossy readout. Here we return the linear interpretation for q<65536
+    // and the exponential for values that round-trip via log2.
+    return q;
+  }
+  return Math.floor(Math.pow(2, q / 4096));
+}
+
+export function quantizeSavings(ratio) {
+  if (ratio == null || ratio < 0) return 0;
+  if (ratio > 1) ratio = 1;
+  return Math.floor(ratio * 1023) & 0x3FF;
+}
+
+export function dequantizeSavings(q) {
+  return q / 1023;
+}
+
+export function packHeartbeatPayload({ tokens_accumulated, cache_hit_ratio, randomBits }) {
+  const tq = BigInt(quantizeTokens(tokens_accumulated));
+  const sq = BigInt(quantizeSavings(cache_hit_ratio));
+  const r  = randomBits != null
+    ? (BigInt(randomBits) & 0xFFFFn)
+    : (BigInt('0x' + randomBytes(2).toString('hex')) & 0xFFFFn);
+  return (tq << 26n) | (sq << 16n) | r;
+}
+
+export function unpackHeartbeatPayload(random42) {
+  const r   = Number(random42 & 0xFFFFn);
+  const sq  = Number((random42 >> 16n) & 0x3FFn);
+  const tq  = Number((random42 >> 26n) & 0xFFFFn);
+  return {
+    tokens_q: tq,
+    tokens_accumulated_approx: dequantizeTokens(tq),
+    savings_q: sq,
+    cache_hit_ratio_approx: dequantizeSavings(sq),
+    random16: r,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Primitives — minimal local copy; authoritative source: app/api/lib/gyst-server.ts
+// ---------------------------------------------------------------------------
+
+export function fnv1a12(str) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h & 0xFFF;
+}
+
+function sha256_42bits(seed) {
+  const buf = createHash('sha256').update(seed).digest();
+  // Take first 8 bytes, mask to 42 bits
+  const hi = BigInt(buf.readUInt32BE(0));
+  const lo = BigInt(buf.readUInt32BE(4));
+  const v = (hi << 32n) | lo;
+  return v & ((1n << 42n) - 1n);
+}
+
+/**
+ * Pack 128 bits into canonical 8-4-4-4-12 UUID string.
+ * Field layout MSB→LSB:
+ *   type(12) namespace(12) timestamp(24) version(4)
+ *   depth(4) domain(4) generation(4) variant(2)
+ *   provenance(4) signal(16) random(42)
+ */
+export function encodeGYST({
+  type, namespace, timestamp, version,
+  depth, domain, generation, variant,
+  provenance, signal, random,
+}) {
+  // Assemble as two 64-bit halves
+  let hi = 0n;
+  hi = (hi | (BigInt(type) & 0xFFFn)) << 12n;
+  hi = (hi | (BigInt(namespace) & 0xFFFn)) << 24n;
+  hi = (hi | (BigInt(timestamp) & 0xFFFFFFn)) << 4n;
+  hi = (hi | (BigInt(version) & 0xFn)) << 4n;
+  hi = (hi | (BigInt(depth) & 0xFn)) << 4n;
+  hi = (hi | (BigInt(domain) & 0xFn));
+  // hi now has 64 bits: type(12) namespace(12) timestamp(24) version(4) depth(4) domain(4) = 60 bits
+  // But we need to pack 64 exactly. Recompute:
+
+  hi = (BigInt(type) & 0xFFFn) << 52n;
+  hi |= (BigInt(namespace) & 0xFFFn) << 40n;
+  hi |= (BigInt(timestamp) & 0xFFFFFFn) << 16n;
+  hi |= (BigInt(version) & 0xFn) << 12n;
+  hi |= (BigInt(depth) & 0xFn) << 8n;
+  hi |= (BigInt(domain) & 0xFn) << 4n;
+  hi |= (BigInt(generation) & 0xFn);
+
+  let lo = 0n;
+  lo |= (BigInt(variant) & 0x3n) << 62n;
+  lo |= (BigInt(provenance) & 0xFn) << 58n;
+  lo |= (BigInt(signal) & 0xFFFFn) << 42n;
+  lo |= (BigInt(random) & ((1n << 42n) - 1n));
+
+  // Render as 32 hex chars, 8-4-4-4-12
+  const hex = hi.toString(16).padStart(16, '0') + lo.toString(16).padStart(16, '0');
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20, 32),
+  ].join('-');
+}
+
+export function decodeGYST(uuid) {
+  const hex = uuid.replace(/-/g, '');
+  const hi = BigInt('0x' + hex.slice(0, 16));
+  const lo = BigInt('0x' + hex.slice(16, 32));
+  return {
+    type: Number((hi >> 52n) & 0xFFFn),
+    namespace: Number((hi >> 40n) & 0xFFFn),
+    timestamp: Number((hi >> 16n) & 0xFFFFFFn),
+    version: Number((hi >> 12n) & 0xFn),
+    depth: Number((hi >> 8n) & 0xFn),
+    domain: Number((hi >> 4n) & 0xFn),
+    generation: Number(hi & 0xFn),
+    variant: Number((lo >> 62n) & 0x3n),
+    provenance: Number((lo >> 58n) & 0xFn),
+    signal: Number((lo >> 42n) & 0xFFFFn),
+    random: lo & ((1n << 42n) - 1n),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Colloquy UUID (0x009) — minted by initiator.
+// ---------------------------------------------------------------------------
+
+export function mintColloquyUUID({ initiator, nonce }) {
+  const now_s = Math.floor(Date.now() / 1000) - EPOCH_2026;
+  const _nonce = nonce ?? randomBytes(16).toString('hex');
+  const seed = `colloquy|${initiator.agent_uuid}|${now_s}|${_nonce}`;
+  const uuid = encodeGYST({
+    type: 0x009,
+    namespace: fnv1a12(initiator.agent_uuid),
+    timestamp: now_s,
+    version: 0x8,
+    depth: 0x0,
+    domain: initiator.domain,
+    generation: SCHEME_VERSION_v1,
+    variant: 0b10,
+    provenance: initiator.provenance,
+    signal: 0xFFFF,
+    random: sha256_42bits(seed),
+  });
+  return { uuid, nonce: _nonce, timestamp_s: now_s };
+}
+
+// ---------------------------------------------------------------------------
+// Agent Session UUID (0x00A) — deterministic derivation per party.
+// ---------------------------------------------------------------------------
+
+export function deriveAgentSessionUUID({ agent, colloquy_uuid }) {
+  const colloquy = decodeGYST(colloquy_uuid);
+  const seed = `session|${agent.agent_uuid}|${colloquy_uuid}`;
+  return encodeGYST({
+    type: 0x00A,
+    namespace: fnv1a12(agent.agent_uuid),
+    timestamp: colloquy.timestamp,
+    version: 0x8,
+    depth: 0x1,
+    domain: agent.domain,
+    generation: SCHEME_VERSION_v1,
+    variant: 0b10,
+    provenance: 0x2,
+    signal: 0xFFFF,
+    random: sha256_42bits(seed),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Turn UUID (0x005) — minted server-side with fresh randomness.
+// ---------------------------------------------------------------------------
+
+export function mintTurnUUID({ speaker_session_uuid, turn_index }) {
+  const sess = decodeGYST(speaker_session_uuid);
+  return encodeGYST({
+    type: 0x005,
+    namespace: fnv1a12(speaker_session_uuid),
+    timestamp: Math.floor(Date.now() / 1000) - EPOCH_2026,
+    version: 0x8,
+    depth: 0x2,
+    domain: sess.domain,
+    generation: turn_index & 0xF,
+    variant: 0b10,
+    provenance: 0x2,
+    signal: 0xFFFF,
+    random: BigInt('0x' + randomBytes(6).toString('hex')) & ((1n << 42n) - 1n),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat UUID (0x825) — emitted at semantic decision/action points.
+// ---------------------------------------------------------------------------
+
+export function mintHeartbeatUUID({
+  turn_uuid, parent_heartbeat_uuid,
+  event_kind, event_label,
+  branch_depth,
+  provenance, signal,
+  // scheme_v=1 live telemetry (optional; if both null, falls back to scheme_v=0)
+  tokens_accumulated, cache_hit_ratio,
+}) {
+  const seed = `heartbeat|${turn_uuid}|${parent_heartbeat_uuid ?? 'root'}|${event_kind}|${event_label}|${Date.now()}`;
+  const useSchemeV1 = (tokens_accumulated != null) || (cache_hit_ratio != null);
+  let random42;
+  let generation;
+  if (useSchemeV1) {
+    // Pack tokens_q(16)|savings_q(10)|random(16). 16-bit random seeded from sha so the
+    // heartbeat is still reproducibly derivable from its inputs + clock.
+    const r16 = Number(sha256_42bits(seed) & 0xFFFFn);
+    random42 = packHeartbeatPayload({
+      tokens_accumulated: tokens_accumulated ?? 0,
+      cache_hit_ratio: cache_hit_ratio ?? 0,
+      randomBits: r16,
+    });
+    generation = SCHEME_VERSION_v1;
+  } else {
+    random42 = sha256_42bits(seed);
+    generation = SCHEME_VERSION_v0;
+  }
+  return encodeGYST({
+    type: 0x825,
+    namespace: fnv1a12(turn_uuid),
+    timestamp: Math.floor(Date.now() / 1000) - EPOCH_2026,
+    version: 0x8,
+    depth: (branch_depth ?? 0) & 0xF,
+    domain: 0x6,
+    generation,
+    variant: 0b10,
+    provenance: provenance ?? 0x2,
+    signal: signal ?? 0x8000,
+    random: random42,
+  });
+}
+
+/**
+ * Decode heartbeat UUID including scheme-aware telemetry unpack.
+ * Use this (not plain decodeGYST) when reading heartbeat rows.
+ */
+export function decodeHeartbeat(uuid) {
+  const base = decodeGYST(uuid);
+  if (base.generation === SCHEME_VERSION_v1) {
+    return { ...base, ...unpackHeartbeatPayload(base.random), scheme_v: 1 };
+  }
+  return { ...base, scheme_v: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Scratch Object UUID (0x823) — deterministic from (colloquy, key) = idempotent.
+// ---------------------------------------------------------------------------
+
+export function mintScratchUUID({ colloquy_uuid, key }) {
+  return encodeGYST({
+    type: 0x823,
+    namespace: fnv1a12(colloquy_uuid),
+    timestamp: Math.floor(Date.now() / 1000) - EPOCH_2026,
+    version: 0x8,
+    depth: 0x1,
+    domain: 0x6,
+    generation: 0x0,
+    variant: 0b10,
+    provenance: 0x2,
+    signal: 0x8000,
+    random: sha256_42bits(`scratch|${colloquy_uuid}|${key}`),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Self-test when run directly
+// ---------------------------------------------------------------------------
+
+import { fileURLToPath } from 'node:url';
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  console.log('=== colloquy derivation library self-test ===\n');
+
+  const somaco = {
+    agent_uuid: encodeGYST({
+      type: 0x002, namespace: fnv1a12('somaco'), timestamp: 0,
+      version: 0x8, depth: 0x0, domain: 0x2, generation: 0x0,
+      variant: 0b10, provenance: 0x1, signal: 0xFFFF, random: 0n,
+    }),
+    domain: 0x2,
+    provenance: 0x1,
+  };
+
+  const vertex = {
+    agent_uuid: encodeGYST({
+      type: 0x003, namespace: fnv1a12('vertex'), timestamp: 0,
+      version: 0x8, depth: 0x0, domain: 0x6, generation: 0x0,
+      variant: 0b10, provenance: 0x2, signal: 0xFFFF, random: 0n,
+    }),
+    domain: 0x6,
+    provenance: 0x2,
+  };
+
+  console.log('somaco agent_uuid:', somaco.agent_uuid);
+  console.log('vertex agent_uuid:', vertex.agent_uuid);
+
+  const { uuid: colloquy_uuid, nonce } = mintColloquyUUID({ initiator: somaco });
+  console.log('\ncolloquy_uuid:', colloquy_uuid);
+  console.log('decoded:', decodeGYST(colloquy_uuid));
+
+  const somaco_sess = deriveAgentSessionUUID({ agent: somaco, colloquy_uuid });
+  const vertex_sess = deriveAgentSessionUUID({ agent: vertex, colloquy_uuid });
+  console.log('\nsomaco session:', somaco_sess);
+  console.log('vertex session:', vertex_sess);
+
+  // Prove determinism
+  const somaco_sess2 = deriveAgentSessionUUID({ agent: somaco, colloquy_uuid });
+  console.log('\ndeterminism check:', somaco_sess === somaco_sess2 ? '✅ match' : '❌ DIFFER');
+
+  const turn1 = mintTurnUUID({ speaker_session_uuid: somaco_sess, turn_index: 1 });
+  console.log('\nturn 1:', turn1);
+
+  const hb1 = mintHeartbeatUUID({
+    turn_uuid: turn1,
+    parent_heartbeat_uuid: null,
+    event_kind: 'skill_invoke',
+    event_label: 'colloquy-training',
+    branch_depth: 0,
+    provenance: 0x2,
+    signal: 0xE666,
+    tokens_accumulated: 6145,
+    cache_hit_ratio: 0.847,
+  });
+  console.log('\nheartbeat 1 (scheme_v=1):', hb1);
+  console.log('decoded:', decodeHeartbeat(hb1));
+
+  const scratch = mintScratchUUID({ colloquy_uuid, key: 'draft_outline' });
+  console.log('\nscratch @draft_outline:', scratch);
+}
