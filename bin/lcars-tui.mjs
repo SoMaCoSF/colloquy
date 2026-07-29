@@ -1,13 +1,14 @@
 ﻿#!/usr/bin/env node
 
 /**
- * Colloquy LCARS TUI Dashboard v2.6
- * Fixes: Double-buffer flicker-free rendering, clean column widths, and interactive Slurping.
+ * Colloquy LCARS TUI Dashboard v2.7
+ * Features: Double-buffered rendering, Ideas Slurper + Auto-Agent Execution Worker.
  */
 
 import readline from 'readline';
 import fs from 'fs';
 import path from 'path';
+import { spawn } from 'child_process';
 import { setupHarness, logError } from '../lib/logger.mjs';
 
 setupHarness('LCARS-TUI');
@@ -45,7 +46,7 @@ function loadIdeas() {
   return ideas;
 }
 
-function executeSlurp(idea) {
+function executeSlurpAndImplement(idea) {
   const docsDir = path.join(process.cwd(), 'docs');
   if (!fs.existsSync(docsDir)) fs.mkdirSync(docsDir, { recursive: true });
 
@@ -54,7 +55,7 @@ function executeSlurp(idea) {
 
   const docContent = `# Architecture Doc: ${idea.title}
 
-- **Status:** Auto-Slurped from LCARS TUI Inbox
+- **Status:** Slurped & Sent to Herdr Agent Worker
 - **Date:** ${new Date().toISOString()}
 - **Session:** 0x009-COLLOQUY-ROOT
 
@@ -63,24 +64,30 @@ function executeSlurp(idea) {
 ## 💡 Overview
 ${idea.title}
 
-## 🎯 Implementation Strategy
-1. Register state schema.
-2. Wire event bus to Herdr socket multiplexer.
+## 🎯 Objectives
+Auto-slurped and handed off to \`bin/agent-worker.mjs\`.
 `;
 
   fs.writeFileSync(filePath, docContent, 'utf8');
 
-  // Mark item as checked in ideas.md
+  // Mark item checked in ideas.md
   const ideasPath = path.join(process.cwd(), 'ideas.md');
   if (fs.existsSync(ideasPath)) {
     let content = fs.readFileSync(ideasPath, 'utf8');
     const target = `- [ ] **${idea.title}**`;
-    const replacement = `- [x] **${idea.title}** (Slurped -> docs/${slug}.md)`;
+    const replacement = `- [x] **${idea.title}** (Implemented -> lib/${slug}.mjs)`;
     content = content.replace(target, replacement);
     fs.writeFileSync(ideasPath, content, 'utf8');
   }
 
-  return `docs/${slug}.md`;
+  // Trigger Agent Worker background process
+  const worker = spawn('node', ['bin/agent-worker.mjs', filePath], {
+    detached: true,
+    stdio: 'ignore'
+  });
+  worker.unref();
+
+  return `docs/${slug}.md -> lib/${slug}.mjs`;
 }
 
 const state = {
@@ -94,13 +101,14 @@ const state = {
   files: [
     "schema/colloquy-tables.sql",
     "bin/colloquy-daemon.mjs",
+    "bin/agent-worker.mjs",
     "bin/slurp.mjs",
     "bin/lcars-tui.mjs",
     "ideas.md"
   ],
   network: [
     { id: "ORCHESTRATOR", ping: "24ms" },
-    { id: "SUB-AGENT-01", ping: "18ms" },
+    { id: "AGENT-WORKER", ping: "12ms" },
     { id: "AUDIT-VERIFIER", ping: "65ms" }
   ],
   nodes: [
@@ -110,17 +118,15 @@ const state = {
     { id: "0x009-FORK-CHILD", depth: 0 }
   ],
   logs: [
-    "LCARS TUI render loop active (double-buffered)",
-    "Press [S] on selected idea to slurp into /docs"
+    "LCARS TUI active with Herdr Agent Execution Pipeline",
+    "Press [S] on selected idea to slurp + auto-implement code"
   ],
-  statusMessage: "Focus: IDEAS pane | Press [TAB] to switch panes | [S] Slurp | [Q] Exit"
+  statusMessage: "Focus: IDEAS pane | [S] Slurp & Auto-Implement | [Q] Exit"
 };
 
-// Clear screen ONCE at startup
 process.stdout.write("\x1b[2J");
 
 function render() {
-  // Return cursor to top-left (0,0) without clearing screen (prevents flicker)
   readline.cursorTo(process.stdout, 0, 0);
 
   const timestamp = new Date().toISOString().split("T")[1].slice(0, 8);
@@ -134,10 +140,10 @@ function render() {
   let out = "";
 
   out += `${ANSI.orange}╔═════════════════════════════════════════════════════════════════════════════════════════════════════════╗${ANSI.reset}\n`;
-  out += `${ANSI.orange}║ ${ANSI.selectedOrange}${ANSI.bold} LCARS-24 █ COLLOQUY IDEAS BROWSER & SWARM CONTROL ${ANSI.reset}               ${ANSI.cyan}${animFrame} LIVE ${ANSI.orange}[${timestamp}] ║${ANSI.reset}\n`;
+  out += `${ANSI.orange}║ ${ANSI.selectedOrange}${ANSI.bold} LCARS-24 █ COLLOQUY IDEAS BROWSER & AGENT WORKER ${ANSI.reset}               ${ANSI.cyan}${animFrame} LIVE ${ANSI.orange}[${timestamp}] ║${ANSI.reset}\n`;
   out += `${ANSI.orange}╠═════════════════════════════════════════════════════════════════════════════════════════════════════════╣${ANSI.reset}\n`;
 
-  out += `${ANSI.purple}[HERDR MULTIPLEXER]${ANSI.reset} Socket: Active | Workspace: w4 | Node: v24.11.1\n`;
+  out += `${ANSI.purple}[HERDR MULTIPLEXER]${ANSI.reset} Socket: Active | Agent Worker: Online | Node: v24.11.1\n`;
   out += `${ANSI.gold}[PROMPT CACHE TTL] ${ANSI.reset} [${"█".repeat(Math.floor(cachePercent / 5))}${"░".repeat(20 - Math.floor(cachePercent / 5))}] ${cachePercent}% (${ttlSeconds}s remaining)\n`;
   out += `${ANSI.cyan}[ACTIVE PANE]      ${ANSI.reset} ${ANSI.bold}${state.activePane.toUpperCase()}${ANSI.reset} | Backlog Items: ${state.ideas.length}\n`;
 
@@ -158,7 +164,6 @@ function render() {
   const maxRows = Math.max(state.ideas.length, state.files.length, state.network.length, state.nodes.length, 9);
 
   for (let i = 0; i < maxRows; i++) {
-    // Column 1: Ideas
     let c1 = "".padEnd(32);
     if (i < state.ideas.length) {
       const item = state.ideas[i];
@@ -167,7 +172,6 @@ function render() {
       c1 = isSel ? `${ANSI.selectedGold}> 💡 ${trunc.padEnd(26)}${ANSI.reset}` : `  💡 ${ANSI.gold}${trunc.padEnd(26)}${ANSI.reset}`;
     }
 
-    // Column 2: Files
     let c2 = "".padEnd(24);
     if (i < state.files.length) {
       const f = state.files[i];
@@ -176,7 +180,6 @@ function render() {
       c2 = isSel ? `${ANSI.selectedCyan}> 📄 ${trunc.padEnd(20)}${ANSI.reset}` : `  📄 ${ANSI.dim}${trunc.padEnd(20)}${ANSI.reset}`;
     }
 
-    // Column 3: Network
     let c3 = "".padEnd(18);
     if (i < state.network.length) {
       const n = state.network[i];
@@ -186,7 +189,6 @@ function render() {
       c3 = isSel ? `${ANSI.selectedPurple}> ${trunc.padEnd(16)}${ANSI.reset}` : `  ${ANSI.purple}${trunc.padEnd(16)}${ANSI.reset}`;
     }
 
-    // Column 4: DAG Nodes
     let c4 = "".padEnd(20);
     if (i < state.nodes.length) {
       const d = state.nodes[i];
@@ -239,12 +241,11 @@ if (process.stdin.isTTY) {
       } else if (key.name === 's' || key.name === 'S') {
         if (state.activePane === "ideas" && state.ideas.length > 0) {
           const selectedIdea = state.ideas[state.ideaIndex];
-          const docPath = executeSlurp(selectedIdea);
+          const result = executeSlurpAndImplement(selectedIdea);
           
-          state.logs.push(`Slurped "${selectedIdea.title}" -> ${docPath}`);
-          state.statusMessage = `✔ Slurped "${selectedIdea.title}" -> ${docPath}`;
+          state.logs.push(`Slurped & Dispatched Agent Worker: ${selectedIdea.title}`);
+          state.statusMessage = `✔ Agent Worker scaffolded code for "${selectedIdea.title}"`;
           
-          // Reload ideas queue
           state.ideas = loadIdeas();
           state.ideaIndex = Math.max(0, Math.min(state.ideaIndex, state.ideas.length - 1));
         }
